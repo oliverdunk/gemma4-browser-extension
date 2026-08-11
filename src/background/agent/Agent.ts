@@ -1,5 +1,4 @@
 import {
-  DynamicCache,
   TextGenerationPipeline,
   TextStreamer,
   pipeline,
@@ -43,7 +42,7 @@ const createInitialMessages = (): Array<Message> => [
     content: SYSTEM_PROMPT,
   },
 ];
-const END_OF_TEXT_TOKEN_REGEX = /<\|end_of_text\|>/g;
+const END_OF_TEXT_TOKEN_REGEX = /<\|end_of_text\|>|<turn\|>|<end_of_turn>/g;
 const sanitizeModelText = (text: string) =>
   text.replace(END_OF_TEXT_TOKEN_REGEX, "").trim();
 
@@ -72,7 +71,6 @@ const getTextGenerationPipeline = async (
 };
 
 class Agent {
-  private pastKeyValues: DynamicCache | null = null;
   private messages: Array<Message> = createInitialMessages();
   private _chatMessages: Array<ChatMessage> = [];
   private chatMessagesListener: Array<
@@ -119,9 +117,6 @@ class Agent {
     }
     const pipe = await this.getTextGenerationPipeline();
     const conversation = [...this.messages];
-    if (!this.pastKeyValues) {
-      this.pastKeyValues = new DynamicCache();
-    }
     let response = "";
 
     // Add placeholder assistant message for streaming UI updates
@@ -152,7 +147,6 @@ class Agent {
     const output: any = await pipe(conversation, {
       tools: this.tools.map(webMCPToolToChatTemplateTool),
       add_generation_prompt: true,
-      past_key_values: this.pastKeyValues,
       max_new_tokens: 1024,
       do_sample: false,
       streamer,
@@ -236,8 +230,11 @@ class Agent {
   };
 
   public runAgent = async (prompt: string): Promise<AgentRunMetrics> => {
+    const MAX_AGENT_STEPS = 5;
+    let currentStep = 0;
     let roleForGeneration: "user" | "tool" = "user";
     let appendPromptMessage = true;
+    let currentPrompt: string | null = prompt;
     const start = performance.now();
     let generatedTokens = 0;
     let prefillTokens = 0;
@@ -271,8 +268,8 @@ class Agent {
     const updateAssistantMessage = (response: string) => {
       const { toolCalls, message } = extractToolCalls(response);
 
-      toolCalls.map((tool) => {
-        if (!Boolean(assistantMessage.tools.find(({ id }) => tool.id === id))) {
+      toolCalls.forEach((tool) => {
+        if (!assistantMessage.tools.some(({ id }) => tool.id === id)) {
           assistantMessage.tools = [
             ...assistantMessage.tools,
             {
@@ -287,14 +284,17 @@ class Agent {
         }
       });
 
-      assistantMessage.content = messageInThisAgentRun + message;
+      assistantMessage.content = messageInThisAgentRun
+        ? `${messageInThisAgentRun}${message ? `\n\n${message}` : ""}`
+        : message;
 
       this.chatMessages = [...prevChatMessages, assistantMessage];
     };
 
-    while (prompt !== null) {
+    while (currentPrompt !== null && currentStep < MAX_AGENT_STEPS) {
+      currentStep += 1;
       const generation = await this.generateText(
-        prompt,
+        currentPrompt,
         roleForGeneration,
         updateAssistantMessage,
         { appendPromptMessage }
@@ -319,29 +319,26 @@ class Agent {
       };
 
       const { toolCalls, message } = extractToolCalls(finalResponse);
-      messageInThisAgentRun = message;
+      if (message) {
+        messageInThisAgentRun = messageInThisAgentRun
+          ? `${messageInThisAgentRun}\n\n${message}`
+          : message;
+      }
 
       if (toolCalls.length === 0) {
-        prompt = null;
+        currentPrompt = null;
       } else {
         const toolResponses = await Promise.all(
           toolCalls.map(this.executeToolCall)
         );
 
+        // Update the assistant message in message history with structured tool calls and empty content
+        // (Gemma chat template expects empty content so it does not prematurely close the turn)
         for (let i = this.messages.length - 1; i >= 0; i -= 1) {
           if (this.messages[i].role === "assistant") {
             this.messages[i] = {
               ...this.messages[i],
-              content: message,
-            };
-            break;
-          }
-        }
-
-        for (let i = this.messages.length - 1; i >= 0; i -= 1) {
-          if (this.messages[i].role === "assistant") {
-            this.messages[i] = {
-              ...this.messages[i],
+              content: "",
               tool_calls: toolCalls.map((call) => ({
                 id: call.id,
                 type: "function",
@@ -361,7 +358,7 @@ class Agent {
             role: "tool" as const,
             tool_call_id: id,
             name,
-            content: result,
+            content: typeof result === "string" ? result : JSON.stringify(result),
           })),
         ];
 
@@ -373,10 +370,11 @@ class Agent {
         }));
 
         this.chatMessages = [...prevChatMessages, assistantMessage];
-        prompt =
-          "Use the tool response to answer the user's last request. Do not call tools again unless required.";
-        roleForGeneration = "user";
-        appendPromptMessage = true;
+
+        // Continue the conversation directly from the tool responses without injecting a fake user prompt
+        currentPrompt = "";
+        roleForGeneration = "tool";
+        appendPromptMessage = false;
       }
     }
     const totalMs = Math.max(0, performance.now() - start);
@@ -392,6 +390,40 @@ class Agent {
       msPerToken: generatedTokens > 0 ? decodeMs / generatedTokens : 0,
     };
     this.chatMessages = [...prevChatMessages, assistantMessage];
+
+    // Compact conversation history across turns:
+    // Retain system message, user messages, and completed assistant text responses.
+    // Prunes intermediate raw tool calls and bulky tool response payloads from previous turns
+    // so total context token length stays safely within WebGPU sliding-window limits.
+    const compactedMessages: Array<Message> = [];
+    const systemMsg = this.messages.find((m) => m.role === "system");
+    if (systemMsg) {
+      compactedMessages.push(systemMsg);
+    }
+
+    for (const msg of this.messages) {
+      if (msg.role === "user") {
+        compactedMessages.push(msg);
+      } else if (
+        msg.role === "assistant" &&
+        typeof msg.content === "string" &&
+        msg.content.trim().length > 0
+      ) {
+        compactedMessages.push({
+          role: "assistant",
+          content: msg.content.trim(),
+        });
+      }
+    }
+
+    const maxHistoryTurns = 8;
+    if (compactedMessages.length > maxHistoryTurns + 1) {
+      const system = compactedMessages[0];
+      const recent = compactedMessages.slice(-maxHistoryTurns);
+      this.messages = [system, ...recent];
+    } else {
+      this.messages = compactedMessages;
+    }
 
     return {
       generatedTokens,
@@ -422,8 +454,6 @@ class Agent {
 
   public clear() {
     this.messages = createInitialMessages();
-    void this.pastKeyValues?.dispose();
-    this.pastKeyValues = null;
     this.chatMessages = [];
   }
 }

@@ -180,6 +180,7 @@ export const extractToolCalls = (
   // Incomplete: <tool_call>... (no closing tag yet)
   const message = textWithoutBareCalls
     .replace(/<\|end_of_text\|>/g, "")
+    .replace(/<turn\|>|<end_of_turn>/g, "")
     .replace(/<\|tool_response\>[\s\S]*?<tool_response\|>/g, "")
     .replace(/<tool_response>[\s\S]*?<\/tool_response>/g, "")
     .replace(/<\|tool_response\>|<tool_response\|>/g, "")

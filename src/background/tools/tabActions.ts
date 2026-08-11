@@ -42,15 +42,12 @@ export const getOpenTabsTool: WebMCPTool = {
           id: tab.id,
           title: tab.title,
           url: tab.url,
-          description,
           active: tab.active,
-          windowId: tab.windowId,
-          index: tab.index,
         };
       });
 
       const tabInfo = await Promise.all(tabInfoPromises);
-      return JSON.stringify(tabInfo, null, 2);
+      return JSON.stringify(tabInfo);
     } catch (error) {
       console.error("[tool:get_open_tabs] failed", error);
       return `Error getting tabs: ${error.toString()}`;

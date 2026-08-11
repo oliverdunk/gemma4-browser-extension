@@ -88,7 +88,7 @@ export const goToTabTool: WebMCPTool = {
 
 export const openUrlTool: WebMCPTool = {
   name: "open_url",
-  description: "Open a specified URL in a new browser tab",
+  description: "Open a specified URL in a new browser tab. Always prepend https:// if not specified.",
   inputSchema: {
     type: "object",
     properties: {
